@@ -1,37 +1,63 @@
+// Load environment variables
 require('dotenv').config();
+
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const compression = require('compression');
 const multer = require('multer');
 const csv = require('csv-parser');
+const compression = require('compression');
 const { Readable } = require('stream');
 
 const app = express();
+
+// Middleware
 app.use(compression());
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  credentials: true
+}));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// MongoDB connection with serverless caching
+// Multer memory storage for serverless
+const upload = multer({ storage: multer.memoryStorage() });
+
+// MongoDB connection
 let cachedDb = null;
-const connectDB = async () => {
-  if (cachedDb && mongoose.connection.readyState === 1) return cachedDb;
-  await mongoose.connect(process.env.MONGODB_URI);
-  cachedDb = mongoose.connection;
-  console.log('MongoDB connected');
-  return cachedDb;
-};
+async function connectToDatabase() {
+  if (cachedDb && mongoose.connection.readyState === 1) {
+    return cachedDb;
+  }
+  try {
+    await mongoose.connect(process.env.MONGODB_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+    });
+    cachedDb = mongoose.connection;
+    console.log('✅ MongoDB connected');
+    return cachedDb;
+  } catch (error) {
+    console.error('❌ MongoDB connection error:', error);
+    throw error;
+  }
+}
 
-// Prevent OverwriteModelError in serverless
+// Mongoose models with OverwriteModelError prevention
 const modelCache = {};
-const getModel = (name, schema) => {
-  if (modelCache[name]) return modelCache[name];
-  modelCache[name] = mongoose.models[name] || mongoose.model(name, schema);
-  return modelCache[name];
-};
 
-// Schemas
-const StudentSchema = new mongoose.Schema({
+function getModel(modelName, schemaDefinition) {
+  if (modelCache[modelName]) {
+    return modelCache[modelName];
+  }
+  const schema = new mongoose.Schema(schemaDefinition, { timestamps: false });
+  const model = mongoose.models[modelName] || mongoose.model(modelName, schema);
+  modelCache[modelName] = model;
+  return model;
+}
+
+// Define all models
+const Student = getModel('Student', {
   studentId: { type: String, required: true, unique: true },
   fullName: { type: String, required: true },
   dob: { type: String, required: true },
@@ -44,7 +70,7 @@ const StudentSchema = new mongoose.Schema({
   blockedAt: Date
 });
 
-const TestSchema = new mongoose.Schema({
+const Test = getModel('Test', {
   testId: { type: String, required: true, unique: true },
   testName: { type: String, required: true },
   duration: { type: Number, required: true },
@@ -60,7 +86,7 @@ const TestSchema = new mongoose.Schema({
   endTime: Date
 });
 
-const QuestionSchema = new mongoose.Schema({
+const Question = getModel('Question', {
   testId: { type: String, required: true },
   questionId: { type: String, required: true },
   type: { type: String, enum: ['mcq', 'numerical'], required: true },
@@ -81,12 +107,12 @@ const QuestionSchema = new mongoose.Schema({
   },
   imageUrls: [String]
 });
-QuestionSchema.index({ testId: 1, questionId: 1 }, { unique: true });
+Question.collection.createIndex({ testId: 1, questionId: 1 }, { unique: true });
 
-const ResultSchema = new mongoose.Schema({
+const Result = getModel('Result', {
   studentId: { type: String, required: true },
   testId: { type: String, required: true },
-  score: { type: Number, required: true, default: 0 },
+  score: { type: Number, required: true },
   rank: Number,
   submittedAt: { type: Date, default: Date.now },
   answers: [{
@@ -99,9 +125,9 @@ const ResultSchema = new mongoose.Schema({
   pausedAt: Date,
   totalPausedDuration: { type: Number, default: 0 }
 });
-ResultSchema.index({ testId: 1, studentId: 1 }, { unique: true });
+Result.collection.createIndex({ testId: 1, studentId: 1 }, { unique: true });
 
-const DiscussionSchema = new mongoose.Schema({
+const Discussion = getModel('Discussion', {
   testId: { type: String, required: true },
   title: { type: String, required: true },
   description: String,
@@ -109,7 +135,7 @@ const DiscussionSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
-const MessageSchema = new mongoose.Schema({
+const Message = getModel('Message', {
   studentId: String,
   sender: { type: String, enum: ['student', 'admin'], required: true },
   content: { type: String, required: true },
@@ -117,393 +143,533 @@ const MessageSchema = new mongoose.Schema({
   timestamp: { type: Date, default: Date.now }
 });
 
-const ConfigSchema = new mongoose.Schema({
+const Config = getModel('Config', {
   key: { type: String, unique: true },
   value: mongoose.Schema.Types.Mixed
 });
 
-// Models
-const Student = getModel('Student', StudentSchema);
-const Test = getModel('Test', TestSchema);
-const Question = getModel('Question', QuestionSchema);
-const Result = getModel('Result', ResultSchema);
-const Discussion = getModel('Discussion', DiscussionSchema);
-const Message = getModel('Message', MessageSchema);
-const Config = getModel('Config', ConfigSchema);
+// Helper: Verify admin token
+function verifyAdminToken(req, res, next) {
+  const token = req.headers['authorization']?.replace('Bearer ', '');
+  // Simple token: "admin-" + timestamp (in production use JWT)
+  if (!token || !token.startsWith('admin-')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
 
-// Multer memory storage
-const upload = multer({ storage: multer.memoryStorage() });
+// ==================== API Routes ====================
 
-// ========== Auth Middleware ==========
-const adminAuth = (req, res, next) => {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (token === 'admin-session-token') next();
-  else res.status(401).json({ error: 'Unauthorized' });
-};
+// Root
+app.get('/api', (req, res) => {
+  res.json({ message: 'NexGen Exam Portal API', version: '1.0.0' });
+});
 
-// ========== Routes ==========
-
-// --- Auth ---
+// -------------------- Auth --------------------
 app.post('/api/auth/admin/login', async (req, res) => {
-  const { username, password } = req.body;
-  if (username === process.env.ADMIN_USERNAME && password === process.env.ADMIN_PASSWORD) {
-    res.json({ success: true, token: 'admin-session-token' });
-  } else {
-    res.status(401).json({ success: false, error: 'Invalid credentials' });
+  try {
+    const { username, password } = req.body;
+    if (username === process.env.ADMIN_USERNAME && password === process.env.ADMIN_PASSWORD) {
+      const token = 'admin-' + Date.now();
+      res.json({ success: true, token });
+    } else {
+      res.status(401).json({ success: false, error: 'Invalid credentials' });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
 app.post('/api/auth/student/login', async (req, res) => {
-  const { studentId, dob } = req.body;
-  await connectDB();
-  const student = await Student.findOne({ studentId, dob });
-  if (!student) return res.status(401).json({ error: 'Invalid credentials' });
-  if (student.status === 'blocked') {
-    return res.json({ blocked: true, reason: student.blockReason });
+  try {
+    const { studentId, dob } = req.body;
+    const student = await Student.findOne({ studentId, dob });
+    if (!student) {
+      return res.status(401).json({ success: false, error: 'Invalid credentials' });
+    }
+    if (student.status === 'blocked') {
+      return res.status(403).json({ blocked: true, reason: student.blockReason });
+    }
+    res.json({ success: true, student });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
-  res.json({ success: true, student });
 });
 
-// --- Students ---
-app.get('/api/students', adminAuth, async (req, res) => {
-  await connectDB();
-  const students = await Student.find().sort('-registeredAt');
-  res.json(students);
+// -------------------- Students --------------------
+app.get('/api/students', verifyAdminToken, async (req, res) => {
+  try {
+    const students = await Student.find().sort({ registeredAt: -1 });
+    res.json(students);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.post('/api/students', adminAuth, async (req, res) => {
-  await connectDB();
+app.post('/api/students', verifyAdminToken, async (req, res) => {
   try {
     const student = new Student(req.body);
     await student.save();
-    res.json(student);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(201).json(student);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
   }
 });
 
-app.put('/api/students/:id/block', adminAuth, async (req, res) => {
-  await connectDB();
-  const { reason } = req.body;
-  const student = await Student.findOneAndUpdate(
-    { studentId: req.params.id },
-    { status: 'blocked', blockReason: reason, blockedAt: new Date() },
-    { new: true }
-  );
-  res.json(student);
+app.put('/api/students/:id/block', verifyAdminToken, async (req, res) => {
+  try {
+    const { reason } = req.body;
+    const student = await Student.findOne({ studentId: req.params.id });
+    if (!student) return res.status(404).json({ error: 'Student not found' });
+    student.status = 'blocked';
+    student.blockReason = reason;
+    student.blockedAt = new Date();
+    await student.save();
+    res.json(student);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.put('/api/students/:id/unblock', adminAuth, async (req, res) => {
-  await connectDB();
-  const student = await Student.findOneAndUpdate(
-    { studentId: req.params.id },
-    { status: 'active', blockReason: null, blockedAt: null },
-    { new: true }
-  );
-  res.json(student);
+app.put('/api/students/:id/unblock', verifyAdminToken, async (req, res) => {
+  try {
+    const student = await Student.findOne({ studentId: req.params.id });
+    if (!student) return res.status(404).json({ error: 'Student not found' });
+    student.status = 'active';
+    student.blockReason = undefined;
+    student.blockedAt = undefined;
+    await student.save();
+    res.json(student);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-// --- Tests ---
-app.get('/api/tests', adminAuth, async (req, res) => {
-  await connectDB();
-  const tests = await Test.find();
-  res.json(tests);
+// -------------------- Tests --------------------
+app.get('/api/tests', verifyAdminToken, async (req, res) => {
+  try {
+    const tests = await Test.find().sort({ createdAt: -1 });
+    res.json(tests);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.post('/api/tests', adminAuth, async (req, res) => {
-  await connectDB();
+app.post('/api/tests', verifyAdminToken, async (req, res) => {
   try {
     const test = new Test(req.body);
     await test.save();
-    res.json(test);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(201).json(test);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
   }
 });
 
-app.put('/api/tests/:id', adminAuth, async (req, res) => {
-  await connectDB();
-  const test = await Test.findOneAndUpdate({ testId: req.params.id }, req.body, { new: true });
-  res.json(test);
+app.put('/api/tests/:id', verifyAdminToken, async (req, res) => {
+  try {
+    const test = await Test.findOneAndUpdate(
+      { testId: req.params.id },
+      req.body,
+      { new: true }
+    );
+    if (!test) return res.status(404).json({ error: 'Test not found' });
+    res.json(test);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.delete('/api/tests/:id', adminAuth, async (req, res) => {
-  await connectDB();
-  const testId = req.params.id;
-  await Test.deleteOne({ testId });
-  await Question.deleteMany({ testId });
-  await Result.deleteMany({ testId });
-  await Discussion.deleteMany({ testId });
-  res.json({ success: true });
+app.delete('/api/tests/:id', verifyAdminToken, async (req, res) => {
+  try {
+    const testId = req.params.id;
+    await Test.deleteOne({ testId });
+    await Question.deleteMany({ testId });
+    await Result.deleteMany({ testId });
+    await Discussion.deleteMany({ testId });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-// --- Questions ---
-app.get('/api/questions/:testId', adminAuth, async (req, res) => {
-  await connectDB();
-  const questions = await Question.find({ testId: req.params.testId }).sort('questionId');
-  res.json(questions);
+// -------------------- Questions --------------------
+app.get('/api/questions/:testId', verifyAdminToken, async (req, res) => {
+  try {
+    const questions = await Question.find({ testId: req.params.testId });
+    res.json(questions);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.post('/api/questions', adminAuth, async (req, res) => {
-  await connectDB();
+app.post('/api/questions', verifyAdminToken, async (req, res) => {
   try {
     const question = new Question(req.body);
     await question.save();
-    res.json(question);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(201).json(question);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
   }
 });
 
-app.put('/api/questions/:id', adminAuth, async (req, res) => {
-  await connectDB();
-  const question = await Question.findByIdAndUpdate(req.params.id, req.body, { new: true });
-  res.json(question);
+app.put('/api/questions/:id', verifyAdminToken, async (req, res) => {
+  try {
+    const question = await Question.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    if (!question) return res.status(404).json({ error: 'Question not found' });
+    res.json(question);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.delete('/api/questions/:id', adminAuth, async (req, res) => {
-  await connectDB();
-  await Question.findByIdAndDelete(req.params.id);
-  res.json({ success: true });
+app.delete('/api/questions/:id', verifyAdminToken, async (req, res) => {
+  try {
+    await Question.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.post('/api/questions/upload/:testId', adminAuth, upload.single('csvFile'), async (req, res) => {
-  await connectDB();
-  const testId = req.params.testId;
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+app.post('/api/questions/upload/:testId', verifyAdminToken, upload.single('csvFile'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No CSV file uploaded' });
+    }
 
-  const results = [];
-  const stream = Readable.from(req.file.buffer.toString());
-  stream
-    .pipe(csv())
-    .on('data', (row) => results.push(row))
-    .on('end', async () => {
-      try {
-        for (const row of results) {
-          const questionData = {
-            testId,
-            questionId: row.questionId,
-            type: row.type,
-            questionText: {
-              en: row.questionText_en,
-              hi: row.questionText_hi || ''
-            },
-            options: [
-              { en: row.option1_en || '', hi: row.option1_hi || '' },
-              { en: row.option2_en || '', hi: row.option2_hi || '' },
-              { en: row.option3_en || '', hi: row.option3_hi || '' },
-              { en: row.option4_en || '', hi: row.option4_hi || '' }
-            ],
-            correctAnswer: row.type === 'mcq' ? parseInt(row.correctAnswer) : parseFloat(row.correctAnswer),
-            tolerance: row.tolerance ? parseFloat(row.tolerance) : undefined,
-            marks: {
-              correct: row.marks_correct ? parseFloat(row.marks_correct) : undefined,
-              wrong: row.marks_wrong ? parseFloat(row.marks_wrong) : undefined,
-              skip: row.marks_skip ? parseFloat(row.marks_skip) : undefined
-            },
-            imageUrls: row.imageUrls ? row.imageUrls.split(';') : []
-          };
-          await Question.findOneAndUpdate(
-            { testId, questionId: row.questionId },
-            questionData,
-            { upsert: true, new: true }
-          );
-        }
-        res.json({ success: true, count: results.length });
-      } catch (err) {
-        res.status(500).json({ error: err.message });
+    const testId = req.params.testId;
+    const results = [];
+    const stream = Readable.from(req.file.buffer.toString());
+    
+    const parser = stream.pipe(csv());
+    
+    for await (const row of parser) {
+      // Parse options array
+      const options = [];
+      for (let i = 1; i <= 4; i++) {
+        options.push({
+          en: row[`option${i}_en`] || '',
+          hi: row[`option${i}_hi`] || ''
+        });
       }
-    });
+
+      // Parse marks
+      const marks = {};
+      if (row.marks_correct) marks.correct = parseFloat(row.marks_correct);
+      if (row.marks_wrong) marks.wrong = parseFloat(row.marks_wrong);
+      if (row.marks_skip) marks.skip = parseFloat(row.marks_skip);
+
+      // Parse correctAnswer
+      let correctAnswer;
+      if (row.type === 'mcq') {
+        correctAnswer = parseInt(row.correctAnswer);
+      } else {
+        correctAnswer = parseFloat(row.correctAnswer);
+      }
+
+      const questionData = {
+        testId,
+        questionId: row.questionId,
+        type: row.type,
+        questionText: {
+          en: row.questionText_en,
+          hi: row.questionText_hi || ''
+        },
+        options: row.type === 'mcq' ? options : [],
+        correctAnswer,
+        tolerance: row.tolerance ? parseFloat(row.tolerance) : undefined,
+        marks: Object.keys(marks).length ? marks : undefined,
+        imageUrls: row.imageUrls ? row.imageUrls.split(';').filter(u => u.trim()) : []
+      };
+
+      // Upsert
+      const existing = await Question.findOne({ testId, questionId: row.questionId });
+      if (existing) {
+        await Question.updateOne({ _id: existing._id }, questionData);
+        results.push({ questionId: row.questionId, action: 'updated' });
+      } else {
+        const q = new Question(questionData);
+        await q.save();
+        results.push({ questionId: row.questionId, action: 'created' });
+      }
+    }
+
+    res.json({ success: true, count: results.length, results });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-// --- Student Test Flow ---
+// -------------------- Student Test Flow --------------------
 app.get('/api/student/available-tests/:studentId', async (req, res) => {
-  await connectDB();
-  const student = await Student.findOne({ studentId: req.params.studentId });
-  if (!student) return res.status(404).json({ error: 'Student not found' });
-  const now = new Date();
-  const tests = await Test.find({
-    isLive: true,
-    allowedClasses: student.class,
-    startTime: { $lte: now },
-    endTime: { $gte: now }
-  });
-  const taken = await Result.find({ studentId: student.studentId }).distinct('testId');
-  const available = tests.filter(t => !taken.includes(t.testId));
-  res.json(available);
+  try {
+    const student = await Student.findOne({ studentId: req.params.studentId });
+    if (!student) return res.status(404).json({ error: 'Student not found' });
+
+    const now = new Date();
+    const tests = await Test.find({
+      isLive: true,
+      allowedClasses: student.class,
+      startTime: { $lte: now },
+      endTime: { $gte: now }
+    });
+
+    // Filter out already taken tests
+    const takenTests = await Result.find({ studentId: student.studentId }).distinct('testId');
+    const available = tests.filter(t => !takenTests.includes(t.testId));
+
+    res.json(available);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.post('/api/student/start-test', async (req, res) => {
-  await connectDB();
-  const { studentId, testId } = req.body;
-  let result = await Result.findOne({ studentId, testId });
-  if (!result) {
-    result = new Result({ studentId, testId, score: 0, answers: [] });
+  try {
+    const { studentId, testId } = req.body;
+    
+    // Check if result already exists
+    let result = await Result.findOne({ studentId, testId });
+    if (result) {
+      return res.json(result);
+    }
+
+    // Create new result entry
+    result = new Result({
+      studentId,
+      testId,
+      score: 0,
+      answers: [],
+      paused: false,
+      totalPausedDuration: 0
+    });
     await result.save();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
-  res.json(result);
 });
 
 app.post('/api/student/submit-test', async (req, res) => {
-  await connectDB();
-  const { studentId, testId, answers } = req.body;
-  const test = await Test.findOne({ testId });
-  const questions = await Question.find({ testId });
-  const marksScheme = test.marks;
-  let score = 0;
-  const processedAnswers = [];
-
-  for (const ans of answers) {
-    const q = questions.find(q => q.questionId === ans.questionId);
-    if (!q) continue;
-    const qMarks = q.marks || marksScheme;
-    let isCorrect = false;
-    if (q.type === 'mcq') {
-      isCorrect = (parseInt(ans.selectedAnswer) === q.correctAnswer);
-    } else {
-      isCorrect = Math.abs(parseFloat(ans.selectedAnswer) - q.correctAnswer) <= (q.tolerance || 0.001);
+  try {
+    const { studentId, testId, answers } = req.body;
+    
+    const test = await Test.findOne({ testId });
+    if (!test) return res.status(404).json({ error: 'Test not found' });
+    
+    const questions = await Question.find({ testId });
+    const questionMap = new Map(questions.map(q => [q.questionId, q]));
+    
+    let score = 0;
+    const evaluatedAnswers = [];
+    
+    for (const ans of answers) {
+      const q = questionMap.get(ans.questionId);
+      if (!q) continue;
+      
+      const marksScheme = q.marks || test.marks;
+      let isCorrect = false;
+      
+      if (q.type === 'mcq') {
+        isCorrect = (parseInt(ans.selectedAnswer) === q.correctAnswer);
+      } else { // numerical
+        const tolerance = q.tolerance || 0;
+        isCorrect = Math.abs(parseFloat(ans.selectedAnswer) - q.correctAnswer) <= tolerance;
+      }
+      
+      const marksAwarded = isCorrect ? marksScheme.correct : (ans.selectedAnswer === null ? marksScheme.skip : marksScheme.wrong);
+      
+      evaluatedAnswers.push({
+        questionId: ans.questionId,
+        selectedAnswer: ans.selectedAnswer,
+        isCorrect,
+        marksAwarded
+      });
+      
+      score += marksAwarded;
     }
-    const awarded = isCorrect ? qMarks.correct : (ans.selectedAnswer ? qMarks.wrong : qMarks.skip);
-    score += awarded;
-    processedAnswers.push({
-      questionId: ans.questionId,
-      selectedAnswer: ans.selectedAnswer,
-      isCorrect,
-      marksAwarded: awarded
+    
+    // Update result
+    const result = await Result.findOneAndUpdate(
+      { studentId, testId },
+      { score, answers: evaluatedAnswers, submittedAt: new Date() },
+      { new: true }
+    );
+    
+    // Recalculate ranks for this test
+    const allResults = await Result.find({ testId }).sort({ score: -1 });
+    let rank = 1;
+    for (const r of allResults) {
+      r.rank = rank++;
+      await r.save();
+    }
+    
+    const finalResult = await Result.findOne({ studentId, testId });
+    res.json({ score: finalResult.score, rank: finalResult.rank });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// -------------------- Pause / Resume (Admin) --------------------
+app.post('/api/admin/pause-test', verifyAdminToken, async (req, res) => {
+  try {
+    const { studentId, testId, password } = req.body;
+    if (password !== process.env.PAUSE_PASSWORD) {
+      return res.status(403).json({ error: 'Invalid pause password' });
+    }
+    
+    const result = await Result.findOne({ studentId, testId });
+    if (!result) return res.status(404).json({ error: 'Result not found' });
+    
+    result.paused = true;
+    result.pausedAt = new Date();
+    await result.save();
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/resume-test', verifyAdminToken, async (req, res) => {
+  try {
+    const { studentId, testId, password } = req.body;
+    if (password !== process.env.RESUME_PASSWORD) {
+      return res.status(403).json({ error: 'Invalid resume password' });
+    }
+    
+    const result = await Result.findOne({ studentId, testId });
+    if (!result) return res.status(404).json({ error: 'Result not found' });
+    
+    if (result.paused && result.pausedAt) {
+      const pausedDuration = Math.floor((new Date() - result.pausedAt) / 1000);
+      result.totalPausedDuration = (result.totalPausedDuration || 0) + pausedDuration;
+    }
+    result.paused = false;
+    result.pausedAt = undefined;
+    await result.save();
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/paused-status/:studentId/:testId', verifyAdminToken, async (req, res) => {
+  try {
+    const result = await Result.findOne({ 
+      studentId: req.params.studentId, 
+      testId: req.params.testId 
     });
+    if (!result) return res.status(404).json({ error: 'Not found' });
+    res.json({ paused: result.paused, totalPausedDuration: result.totalPausedDuration });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
+});
 
-  const result = await Result.findOneAndUpdate(
-    { studentId, testId },
-    { score, answers: processedAnswers, submittedAt: new Date() },
-    { new: true }
-  );
-
-  // Update ranks
-  const allResults = await Result.find({ testId }).sort('-score');
-  for (let i = 0; i < allResults.length; i++) {
-    allResults[i].rank = i + 1;
-    await allResults[i].save();
+// -------------------- Results --------------------
+app.get('/api/results', verifyAdminToken, async (req, res) => {
+  try {
+    const results = await Result.find().populate('studentId').sort({ submittedAt: -1 });
+    res.json(results);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
-
-  res.json({ score, rank: result.rank });
-});
-
-// --- Pause / Resume (Admin) ---
-app.post('/api/admin/pause-test', adminAuth, async (req, res) => {
-  const { studentId, testId, password } = req.body;
-  if (password !== process.env.PAUSE_PASSWORD) return res.status(403).json({ error: 'Invalid password' });
-  await connectDB();
-  await Result.findOneAndUpdate(
-    { studentId, testId },
-    { paused: true, pausedAt: new Date() }
-  );
-  res.json({ success: true });
-});
-
-app.post('/api/admin/resume-test', adminAuth, async (req, res) => {
-  const { studentId, testId, password } = req.body;
-  if (password !== process.env.RESUME_PASSWORD) return res.status(403).json({ error: 'Invalid password' });
-  await connectDB();
-  const result = await Result.findOne({ studentId, testId });
-  if (!result || !result.paused) return res.status(400).json({ error: 'Not paused' });
-  const pausedDuration = Math.floor((new Date() - result.pausedAt) / 1000);
-  result.totalPausedDuration = (result.totalPausedDuration || 0) + pausedDuration;
-  result.paused = false;
-  result.pausedAt = null;
-  await result.save();
-  res.json({ success: true });
-});
-
-app.get('/api/admin/paused-status/:studentId/:testId', adminAuth, async (req, res) => {
-  await connectDB();
-  const result = await Result.findOne({ studentId: req.params.studentId, testId: req.params.testId });
-  res.json({ paused: result?.paused || false, totalPausedDuration: result?.totalPausedDuration || 0 });
-});
-
-// --- Results ---
-app.get('/api/results', adminAuth, async (req, res) => {
-  await connectDB();
-  const results = await Result.find().lean();
-  // Populate student and test names manually
-  for (let r of results) {
-    const student = await Student.findOne({ studentId: r.studentId });
-    const test = await Test.findOne({ testId: r.testId });
-    r.studentName = student?.fullName || r.studentId;
-    r.testName = test?.testName || r.testId;
-  }
-  res.json(results);
 });
 
 app.get('/api/results/student/:studentId', async (req, res) => {
-  await connectDB();
-  const results = await Result.find({ studentId: req.params.studentId }).lean();
-  for (let r of results) {
-    const test = await Test.findOne({ testId: r.testId });
-    r.testName = test?.testName || r.testId;
+  try {
+    const results = await Result.find({ studentId: req.params.studentId }).sort({ submittedAt: -1 });
+    res.json(results);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
-  res.json(results);
 });
 
-app.get('/api/results/test/:testId', adminAuth, async (req, res) => {
-  await connectDB();
-  const results = await Result.find({ testId: req.params.testId }).sort('-score').lean();
-  for (let r of results) {
-    const student = await Student.findOne({ studentId: r.studentId });
-    r.studentName = student?.fullName || r.studentId;
+app.get('/api/results/test/:testId', verifyAdminToken, async (req, res) => {
+  try {
+    const results = await Result.find({ testId: req.params.testId }).sort({ score: -1 });
+    res.json(results);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
-  res.json(results);
 });
 
-// --- Discussions ---
+// -------------------- Discussions --------------------
 app.get('/api/discussions/:testId', async (req, res) => {
-  await connectDB();
-  const discussions = await Discussion.find({ testId: req.params.testId }).sort('-createdAt');
-  res.json(discussions);
+  try {
+    const discussions = await Discussion.find({ testId: req.params.testId }).sort({ createdAt: -1 });
+    res.json(discussions);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.post('/api/discussions', adminAuth, async (req, res) => {
-  await connectDB();
-  const discussion = new Discussion(req.body);
-  await discussion.save();
-  res.json(discussion);
+app.post('/api/discussions', verifyAdminToken, async (req, res) => {
+  try {
+    const discussion = new Discussion(req.body);
+    await discussion.save();
+    res.status(201).json(discussion);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
 });
 
-app.delete('/api/discussions/:id', adminAuth, async (req, res) => {
-  await connectDB();
-  await Discussion.findByIdAndDelete(req.params.id);
-  res.json({ success: true });
+app.delete('/api/discussions/:id', verifyAdminToken, async (req, res) => {
+  try {
+    await Discussion.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-// --- Messages ---
-app.get('/api/messages', async (req, res) => {
-  await connectDB();
-  const { studentId } = req.query;
-  const filter = studentId ? { studentId } : {};
-  const messages = await Message.find(filter).sort('timestamp');
-  res.json(messages);
+// -------------------- Messages --------------------
+app.get('/api/messages', verifyAdminToken, async (req, res) => {
+  try {
+    const { studentId } = req.query;
+    const query = studentId ? { studentId } : {};
+    const messages = await Message.find(query).sort({ timestamp: -1 });
+    res.json(messages);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.post('/api/messages', async (req, res) => {
-  await connectDB();
-  const message = new Message(req.body);
-  await message.save();
-  res.json(message);
+  try {
+    const message = new Message(req.body);
+    await message.save();
+    res.status(201).json(message);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
 });
 
-// --- Settings ---
-app.post('/api/settings/password', adminAuth, async (req, res) => {
-  // In production, you'd update Config collection.
-  res.json({ success: true, message: 'Password updated (simulated)' });
+// -------------------- Settings --------------------
+app.post('/api/settings/password', verifyAdminToken, async (req, res) => {
+  try {
+    const { newPassword } = req.body;
+    // In a real app, you'd update environment variable or Config collection
+    // For demo, we'll just return success
+    res.json({ success: true, message: 'Password updated (simulated)' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-// Root route
-app.get('/api', (req, res) => res.send('NexGen Exam API'));
-
-// Error handling
+// Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
   res.status(500).json({ error: 'Something went wrong!' });
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+connectToDatabase().then(() => {
+  app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+  });
 });
 
 // Export for Vercel
