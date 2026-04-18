@@ -5,7 +5,6 @@ const cors = require('cors');
 const compression = require('compression');
 const multer = require('multer');
 const csv = require('csv-parser');
-const stream = require('stream');
 const { Readable } = require('stream');
 
 const app = express();
@@ -87,7 +86,7 @@ QuestionSchema.index({ testId: 1, questionId: 1 }, { unique: true });
 const ResultSchema = new mongoose.Schema({
   studentId: { type: String, required: true },
   testId: { type: String, required: true },
-  score: { type: Number, required: true },
+  score: { type: Number, required: true, default: 0 },
   rank: Number,
   submittedAt: { type: Date, default: Date.now },
   answers: [{
@@ -138,7 +137,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 // ========== Auth Middleware ==========
 const adminAuth = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
-  if (token === 'admin-session-token') next(); // simplified for demo
+  if (token === 'admin-session-token') next();
   else res.status(401).json({ error: 'Unauthorized' });
 };
 
@@ -425,19 +424,34 @@ app.get('/api/admin/paused-status/:studentId/:testId', adminAuth, async (req, re
 // --- Results ---
 app.get('/api/results', adminAuth, async (req, res) => {
   await connectDB();
-  const results = await Result.find().populate('studentId', 'fullName').populate('testId', 'testName');
+  const results = await Result.find().lean();
+  // Populate student and test names manually
+  for (let r of results) {
+    const student = await Student.findOne({ studentId: r.studentId });
+    const test = await Test.findOne({ testId: r.testId });
+    r.studentName = student?.fullName || r.studentId;
+    r.testName = test?.testName || r.testId;
+  }
   res.json(results);
 });
 
 app.get('/api/results/student/:studentId', async (req, res) => {
   await connectDB();
-  const results = await Result.find({ studentId: req.params.studentId }).populate('testId', 'testName');
+  const results = await Result.find({ studentId: req.params.studentId }).lean();
+  for (let r of results) {
+    const test = await Test.findOne({ testId: r.testId });
+    r.testName = test?.testName || r.testId;
+  }
   res.json(results);
 });
 
 app.get('/api/results/test/:testId', adminAuth, async (req, res) => {
   await connectDB();
-  const results = await Result.find({ testId: req.params.testId }).sort('-score').populate('studentId', 'fullName');
+  const results = await Result.find({ testId: req.params.testId }).sort('-score').lean();
+  for (let r of results) {
+    const student = await Student.findOne({ studentId: r.studentId });
+    r.studentName = student?.fullName || r.studentId;
+  }
   res.json(results);
 });
 
@@ -479,8 +493,7 @@ app.post('/api/messages', async (req, res) => {
 
 // --- Settings ---
 app.post('/api/settings/password', adminAuth, async (req, res) => {
-  // In a real app, you'd update the admin password stored somewhere.
-  // Here we just return success as env vars are immutable.
+  // In production, you'd update Config collection.
   res.json({ success: true, message: 'Password updated (simulated)' });
 });
 
